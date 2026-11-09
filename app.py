@@ -380,19 +380,33 @@ def withdraw():
     pay_link = ""
 
     # ── PAYPAL (Excel + paypal.me link, no API verification) ──
+      # ── PAYPAL (PayPal.me link only — no API lock-in) ──
     if method == "paypal":
-        paypal_email = BROKER_CONFIG["PAYPAL_EMAIL"]
-        if not paypal_email:
+        paypal_username = BROKER_CONFIG["PAYPAL_EMAIL"].strip().lstrip("@").replace(" ", "")
+        
+        # Validation
+        if not paypal_username:
             return jsonify({
                 "status": "error",
-                "reason": "PAYPAL_EMAIL env var not set on Render"
+                "reason": "PAYPAL_EMAIL env var not set. Must be your PayPal.me USERNAME."
             }), 400
-
-        # paypal.me link — opens in browser, no API approval needed
-        pay_link = f"https://www.paypal.com/paypalme/{paypal_email}/{usd_amount}"
-        destination = paypal_email
-        note = f"→ PayPal ${usd_amount:,.2f} USD to {paypal_email}"
-
+        
+        if "@" in paypal_username:
+            return jsonify({
+                "status": "error",
+                "reason": "PAYPAL_EMAIL contains '@'. Use your PayPal.me USERNAME only (e.g. 'sintu-trades', NOT your email)."
+            }), 400
+        
+        if len(paypal_username) < 3:
+            return jsonify({
+                "status": "error",
+                "reason": "PayPal.me username too short (min 3 chars)."
+            }), 400
+        
+        # Build link
+        pay_link = f"https://www.paypal.com/paypalme/{paypal_username}/{usd_amount}"
+        destination = f"@{paypal_username}"
+        note = f"→ PayPal ${usd_amount:,.2f} USD to paypal.me/{paypal_username}"
     # ── LUNO ──
     elif method == "luno":
         btc = zar_to_btc(amount_zar)
