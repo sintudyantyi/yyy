@@ -1,15 +1,15 @@
 # ═══════════════════════════════════════════════════════════════
-# CRYPTO TRADING DASHBOARD - PHASE 1
-# Single-file Flask app. Deploy from GitHub to Render.
+# CRYPTO TRADING DASHBOARD - PHASE 1 + PAYPAL/EXCEL
+# Deploy from GitHub to Render.
 # Starting balance: R120,000,000 (simulated)
-# Base currency: ZAR
-# Crypto asset: XAUUSD trades, balance held in BTC-equivalent
 # ═══════════════════════════════════════════════════════════════
 
 from flask import Flask, request, jsonify, Response
 import sqlite3
 import os
 from datetime import datetime
+import openpyxl
+from openpyxl.styles import Font, PatternFill
 
 app = Flask(__name__)
 DB = "dashboard.db"
@@ -21,8 +21,8 @@ START_BALANCE_ZAR = 120_000_000.00
 BROKER_MODE = "SIMULATED"
 BASE_CURRENCY = "ZAR"
 CRYPTO_SYMBOL = "BTC"
-ZAR_PER_USD = 18.50      # edit later for live rate
-ZAR_PER_BTC = 1_200_000  # edit later for live rate
+ZAR_PER_USD = 18.50
+ZAR_PER_BTC = 1_200_000
 
 BROKER_CONFIG = {
     "OANDA_TOKEN": os.environ.get("OANDA_TOKEN", ""),
@@ -33,6 +33,79 @@ BROKER_CONFIG = {
     "BANK_ACCOUNT": os.environ.get("BANK_ACCOUNT", ""),
     "BTC_WALLET": os.environ.get("BTC_WALLET", ""),
 }
+
+# ═══════════════════════════════════════════════════════════════
+# EXCEL SETUP
+# ═══════════════════════════════════════════════════════════════
+EXCEL_FILE = "withdrawals.xlsx"
+
+def init_excel():
+    """Create Excel file with PayPal + Master sheets if not exists."""
+    if not os.path.exists(EXCEL_FILE):
+        wb = openpyxl.Workbook()
+
+        # Master sheet
+        ws_master = wb.active
+        ws_master.title = "All Withdrawals"
+        master_headers = ["Date", "ID", "Method", "Amount (ZAR)",
+                          "Amount (USD)", "Crypto Amt", "Status", "Destination"]
+        ws_master.append(master_headers)
+
+        # PayPal sheet
+        ws_pp = wb.create_sheet("PayPal")
+        pp_headers = ["Date", "ID", "Amount (ZAR)", "Amount (USD)",
+                      "Status", "PayPal Email", "Pay Link"]
+        ws_pp.append(pp_headers)
+
+        # Style
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="0A2540", end_color="0A2540", fill_type="solid")
+        for ws in [ws_master, ws_pp]:
+            for cell in ws[1]:
+                cell.font = header_font
+                cell.fill = header_fill
+
+        wb.save(EXCEL_FILE)
+        print(f"✅ Created {EXCEL_FILE}")
+    else:
+        print(f"📂 Existing {EXCEL_FILE} loaded")
+
+init_excel()
+
+def log_withdrawal_to_excel(wid, amount_zar, amount_usd, method,
+                            crypto_amount, status, destination, pay_link=""):
+    """Append row to Master + PayPal sheet (if method=paypal)."""
+    try:
+        wb = openpyxl.load_workbook(EXCEL_FILE)
+
+        # Master
+        ws_master = wb["All Withdrawals"]
+        ws_master.append([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            wid, method,
+            round(amount_zar, 2), round(amount_usd, 2),
+            round(crypto_amount, 8) if crypto_amount else 0,
+            status, destination
+        ])
+
+        # PayPal
+        if method == "paypal":
+            ws_pp = wb["PayPal"]
+            ws_pp.append([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                wid,
+                round(amount_zar, 2),
+                round(amount_usd, 2),
+                status,
+                destination,
+                pay_link
+            ])
+
+        wb.save(EXCEL_FILE)
+        return True
+    except Exception as e:
+        print(f"⚠️ Excel write failed: {e}")
+        return False
 
 # ═══════════════════════════════════════════════════════════════
 # DATABASE
@@ -64,7 +137,8 @@ def init_db():
             method TEXT NOT NULL,
             status TEXT DEFAULT 'pending',
             note TEXT DEFAULT '',
-            crypto_amount REAL DEFAULT 0
+            crypto_amount REAL DEFAULT 0,
+            pay_link TEXT DEFAULT ''
         )
     """)
     c.execute("""
@@ -126,7 +200,6 @@ def health():
         "time": datetime.utcnow().isoformat()
     })
 
-# ── SUMMARY ──
 @app.route('/api/summary')
 def summary():
     start_zar = get_start_balance()
@@ -193,13 +266,11 @@ def summary():
         "zar_per_usd": ZAR_PER_USD
     })
 
-# ── TRADES ──
 @app.route('/api/trades')
 def trades():
     rows = query("SELECT * FROM trades ORDER BY id DESC LIMIT 200")
     return jsonify([dict(r) for r in rows])
 
-# ── MANUAL SIMULATED TRADE ──
 @app.route('/api/manual_trade', methods=['POST'])
 def manual_trade():
     data = request.json or {}
@@ -226,7 +297,6 @@ def manual_trade():
 
     return jsonify({"status": "created"})
 
-# ── INCOMING SIGNAL (Phase 3: from MT4 indicator) ──
 @app.route('/signal', methods=['POST'])
 def signal():
     data = request.json or {}
@@ -248,7 +318,6 @@ def signal():
     )
     return jsonify({"status": "logged"})
 
-# ── CLOSE TRADE ──
 @app.route('/api/close_trade/<int:trade_id>', methods=['POST'])
 def close_trade(trade_id):
     data = request.json or {}
@@ -284,9 +353,8 @@ def close_trade(trade_id):
     })
 
 # ═══════════════════════════════════════════════════════════════
-# WITHDRAWAL SYSTEM — 4 METHODS (PayPal / Luno / Bank / BTC)
+# WITHDRAWAL — WITH PAYPAL + EXCEL
 # ═══════════════════════════════════════════════════════════════
-
 @app.route('/api/withdraw', methods=['POST'])
 def withdraw():
     data = request.json or {}
@@ -306,39 +374,76 @@ def withdraw():
         }), 400
 
     crypto_amount = 0
+    usd_amount = round(amount_zar / ZAR_PER_USD, 2)
     note = ""
+    destination = ""
+    pay_link = ""
 
+    # ── PAYPAL (Excel + paypal.me link, no API verification) ──
     if method == "paypal":
-        usd = amount_zar / ZAR_PER_USD
-        note = f"→ PayPal: ${usd:,.2f} USD to {BROKER_CONFIG['PAYPAL_EMAIL'] or 'SET_ENV'}"
+        paypal_email = BROKER_CONFIG["PAYPAL_EMAIL"]
+        if not paypal_email:
+            return jsonify({
+                "status": "error",
+                "reason": "PAYPAL_EMAIL env var not set on Render"
+            }), 400
+
+        # paypal.me link — opens in browser, no API approval needed
+        pay_link = f"https://www.paypal.com/paypalme/{paypal_email}/{usd_amount}"
+        destination = paypal_email
+        note = f"→ PayPal ${usd_amount:,.2f} USD to {paypal_email}"
+
+    # ── LUNO ──
     elif method == "luno":
         btc = zar_to_btc(amount_zar)
         crypto_amount = btc
-        note = f"→ Luno: {btc:.8f} BTC to ZAR account"
+        destination = "Luno ZAR account"
+        note = f"→ Luno: {btc:.8f} BTC"
+
+    # ── BTC ──
     elif method == "btc":
         btc = zar_to_btc(amount_zar)
         crypto_amount = btc
-        note = f"→ BTC: {btc:.8f} BTC to {BROKER_CONFIG['BTC_WALLET'] or 'SET_ENV'}"
-    elif method == "bank":
-        note = f"→ SA Bank EFT: {fmt_zar(amount_zar)} to {BROKER_CONFIG['BANK_ACCOUNT'] or 'SET_ENV'}"
+        destination = BROKER_CONFIG["BTC_WALLET"] or "SET_BTC_WALLET_ENV"
+        note = f"→ BTC: {btc:.8f} to {destination}"
 
+    # ── BANK ──
+    elif method == "bank":
+        destination = BROKER_CONFIG["BANK_ACCOUNT"] or "SET_BANK_ACCOUNT_ENV"
+        note = f"→ SA Bank EFT: {fmt_zar(amount_zar)} to {destination}"
+
+    # Insert into DB
     execute(
         """INSERT INTO withdrawals
-           (timestamp, amount_zar, method, status, note, crypto_amount)
-           VALUES (?,?,?,?,?,?)""",
+           (timestamp, amount_zar, method, status, note, crypto_amount, pay_link)
+           VALUES (?,?,?,?,?,?,?)""",
         (datetime.utcnow().isoformat(),
-         amount_zar, method, "pending", note, crypto_amount)
+         amount_zar, method, "pending", note, crypto_amount, pay_link)
     )
-
     wid = query("SELECT last_insert_rowid() AS id", one=True)["id"]
+
+    # Write to Excel
+    log_withdrawal_to_excel(
+        wid=wid,
+        amount_zar=amount_zar,
+        amount_usd=usd_amount,
+        method=method,
+        crypto_amount=crypto_amount,
+        status="pending",
+        destination=destination,
+        pay_link=pay_link
+    )
 
     return jsonify({
         "status": "pending",
         "withdrawal_id": wid,
         "amount_zar": round(amount_zar, 2),
+        "amount_usd": usd_amount,
         "crypto_amount": round(crypto_amount, 8),
         "method": method,
         "note": note,
+        "pay_link": pay_link,
+        "destination": destination,
         "broker_mode": BROKER_MODE
     })
 
@@ -357,7 +462,19 @@ def cancel_withdrawal(wid):
     execute("UPDATE withdrawals SET status='cancelled' WHERE id=?", (wid,))
     return jsonify({"status": "cancelled"})
 
-# ── RESET ──
+# ── Download Excel ──
+@app.route('/download/excel')
+def download_excel():
+    if not os.path.exists(EXCEL_FILE):
+        return jsonify({"status": "error", "reason": "no excel file yet"}), 404
+    with open(EXCEL_FILE, "rb") as f:
+        data = f.read()
+    return Response(
+        data,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=withdrawals.xlsx"}
+    )
+
 @app.route('/api/reset', methods=['POST'])
 def reset():
     execute("DELETE FROM trades")
@@ -365,7 +482,7 @@ def reset():
     return jsonify({"status": "reset"})
 
 # ═══════════════════════════════════════════════════════════════
-# DASHBOARD (HTML embedded)
+# DASHBOARD HTML
 # ═══════════════════════════════════════════════════════════════
 
 DASHBOARD_HTML = r"""
@@ -410,7 +527,9 @@ button:hover{opacity:.85}
 .btn-luno{background:#00b5e2;color:#000;border:none}
 .btn-bank{background:#FFD700;color:#0a1929;border:none}
 .btn-btc{background:#f7931a;color:#000;border:none}
+.btn-excel{background:#1D6F42;color:#fff;border:none;padding:10px 16px;border-radius:8px;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block}
 .msg{margin-top:12px;font-weight:600;font-size:.85rem;word-break:break-word}
+.msg a{color:#FFD700;font-weight:700}
 .table-section{background:#112d4e;border:1px solid #1e4976;border-radius:12px;padding:20px;margin-bottom:20px;overflow-x:auto}
 table{width:100%;border-collapse:collapse;min-width:700px}
 th{text-align:left;padding:10px;color:#00A8A8;font-size:.72rem;text-transform:uppercase;letter-spacing:.5px;border-bottom:2px solid #1e4976}
@@ -455,7 +574,7 @@ footer{margin-top:32px;padding-top:16px;border-top:2px solid #1e4976;display:fle
 
   <div class="panel">
     <h2>💸 Withdraw (ZAR)</h2>
-    <p class="hint">Pick method — all 4 wired to Phase 2</p>
+    <p class="hint">PayPal → Excel + paypal.me link · no API lock-in</p>
     <div class="row">
       <input type="number" id="wd-amount" step="0.01" placeholder="Amount in R"/>
     </div>
@@ -466,6 +585,9 @@ footer{margin-top:32px;padding-top:16px;border-top:2px solid #1e4976;display:fle
       <button onclick="requestWithdrawal('bank')" class="btn-bank">🏦 SA Bank EFT</button>
     </div>
     <div class="msg" id="wd-msg"></div>
+    <div style="margin-top:14px">
+      <a href="/download/excel" class="btn-excel">📊 Download Excel</a>
+    </div>
   </div>
 </section>
 
@@ -603,8 +725,12 @@ async function requestWithdrawal(method){
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({amount_zar: amount, method})
   });
-  if(r.status==='rejected'){
-    msg.textContent='❌ '+r.reason; msg.className='msg negative';
+  if(r.status==='rejected' || r.status==='error'){
+    msg.textContent='❌ '+(r.reason||'failed'); msg.className='msg negative';
+  } else if(r.pay_link){
+    msg.innerHTML = `✅ #${r.withdrawal_id} · ${fmtZAR(r.amount_zar)} via PAYPAL — logged to Excel<br>`
+                  + `<a href="${r.pay_link}" target="_blank">→ Open PayPal.me to pay $${r.amount_usd}</a>`;
+    msg.className='msg positive';
   } else {
     msg.textContent=`✅ #${r.withdrawal_id} · ${fmtZAR(r.amount_zar)} via ${r.method.toUpperCase()} — ${r.note}`;
     msg.className='msg positive';
