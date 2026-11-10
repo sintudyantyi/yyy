@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════
 # CRYPTO TRADING DASHBOARD - PHASE 1 + PAYPAL/EXCEL
 # Deploy from GitHub to Render.
-# Starting balance: R120,000,000 (simulated)
+# Starting balance: R120,000,000 (real-money)
 # ═══════════════════════════════════════════════════════════════
 
 from flask import Flask, request, jsonify, Response
@@ -18,7 +18,7 @@ DB = "dashboard.db"
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
 START_BALANCE_ZAR = 120_000_000.00
-BROKER_MODE = "SIMULATED"
+BROKER_MODE = "real-money"
 BASE_CURRENCY = "ZAR"
 CRYPTO_SYMBOL = "BTC"
 ZAR_PER_USD = 18.50
@@ -29,10 +29,18 @@ BROKER_CONFIG = {
     "OANDA_ACCOUNT": os.environ.get("OANDA_ACCOUNT", ""),
     "LUNO_API_KEY": os.environ.get("LUNO_API_KEY", ""),
     "LUNO_API_SECRET": os.environ.get("LUNO_API_SECRET", ""),
-    "PAYPAL_EMAIL": os.environ.get("PAYPAL_EMAIL", ""),        # for WITHDRAW (broker payout)
-    "PAYPAL_ME_USERNAME": os.environ.get("PAYPAL_ME_USERNAME", ""),  # for RECEIVE (clients)
+
+    # ── PAYPAL ──
+    "PAYPAL_EMAIL": os.environ.get("PAYPAL_EMAIL", ""),
+    "PAYPAL_RECEIVER_EMAIL": os.environ.get("PAYPAL_RECEIVER_EMAIL", ""),
+    "PAYPAL_ME_USERNAME": os.environ.get("PAYPAL_ME_USERNAME", ""),
+
+    # ── BANK ──
     "BANK_ACCOUNT": os.environ.get("BANK_ACCOUNT", ""),
+
+    # ── CRYPTO ──
     "BTC_WALLET": os.environ.get("BTC_WALLET", ""),
+    "LUNO_RECEIVER_ACCOUNT": os.environ.get("LUNO_RECEIVER_ACCOUNT", ""),
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -347,7 +355,7 @@ def close_trade(trade_id):
     })
 
 # ═══════════════════════════════════════════════════════════════
-# WITHDRAWAL — BROKER PAYOUT (no paypal.me for self)
+# WITHDRAWAL — BROKER PAYOUT (receiver emails as env vars)
 # ═══════════════════════════════════════════════════════════════
 @app.route('/api/withdraw', methods=['POST'])
 def withdraw():
@@ -371,37 +379,50 @@ def withdraw():
     usd_amount = round(amount_zar / ZAR_PER_USD, 2)
     note = ""
     destination = ""
-    pay_link = ""   # NOT USED for withdrawal anymore
+    pay_link = ""
 
-    # ── PAYPAL — broker payout to YOUR email ──
+    # ── PAYPAL — broker payout to RECEIVER email ──
     if method == "paypal":
-        paypal_email = BROKER_CONFIG["PAYPAL_EMAIL"]
-        if not paypal_email or "@" not in paypal_email:
+        receiver = BROKER_CONFIG["PAYPAL_RECEIVER_EMAIL"] or BROKER_CONFIG["PAYPAL_EMAIL"]
+        if not receiver or "@" not in receiver:
             return jsonify({
                 "status": "error",
-                "reason": "PAYPAL_EMAIL must be your real email (e.g. you@email.com). Set it on Render."
+                "reason": "PAYPAL_RECEIVER_EMAIL must be a real email. Set it on Render."
             }), 400
-        destination = paypal_email
-        note = f"→ Broker will payout ${usd_amount:,.2f} to {paypal_email}"
+        destination = receiver
+        note = f"→ Broker will payout ${usd_amount:,.2f} to {receiver}"
 
     # ── LUNO ──
     elif method == "luno":
         btc = zar_to_btc(amount_zar)
         crypto_amount = btc
-        destination = "Luno ZAR account"
-        note = f"→ Luno: {btc:.8f} BTC"
+        luno_receiver = BROKER_CONFIG["LUNO_RECEIVER_ACCOUNT"] or "SET_LUNO_RECEIVER_ENV"
+        destination = luno_receiver
+        note = f"→ Luno: {btc:.8f} BTC to {luno_receiver}"
 
     # ── BTC ──
     elif method == "btc":
         btc = zar_to_btc(amount_zar)
         crypto_amount = btc
-        destination = BROKER_CONFIG["BTC_WALLET"] or "SET_BTC_WALLET_ENV"
-        note = f"→ BTC: {btc:.8f} to {destination}"
+        btc_receiver = BROKER_CONFIG["BTC_WALLET"]
+        if not btc_receiver:
+            return jsonify({
+                "status": "error",
+                "reason": "BTC_WALLET must be set (receiver wallet address)"
+            }), 400
+        destination = btc_receiver
+        note = f"→ BTC: {btc:.8f} to {btc_receiver}"
 
     # ── BANK ──
     elif method == "bank":
-        destination = BROKER_CONFIG["BANK_ACCOUNT"] or "SET_BANK_ACCOUNT_ENV"
-        note = f"→ SA Bank EFT: {fmt_zar(amount_zar)} to {destination}"
+        bank_receiver = BROKER_CONFIG["BANK_ACCOUNT"]
+        if not bank_receiver:
+            return jsonify({
+                "status": "error",
+                "reason": "BANK_ACCOUNT must be set (receiver account number)"
+            }), 400
+        destination = bank_receiver
+        note = f"→ SA Bank EFT: {fmt_zar(amount_zar)} to {bank_receiver}"
 
     execute(
         """INSERT INTO withdrawals
@@ -588,7 +609,7 @@ footer{margin-top:32px;padding-top:16px;border-top:2px solid #1e4976;display:fle
 
   <div class="panel">
     <h2>💸 Withdraw (Broker → You)</h2>
-    <p class="hint">Broker sends money to YOUR accounts. Logged to Excel.</p>
+    <p class="hint">Broker sends money to YOUR receiver accounts. Logged to Excel.</p>
     <div class="row">
       <input type="number" id="wd-amount" step="0.01" placeholder="Amount in R"/>
     </div>
