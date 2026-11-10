@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════
-# CRYPTO TRADING DASHBOARD - PHASE 1 + PAYPAL/EXCEL
+# CRYPTO TRADING DASHBOARD - PHASE 2 (Real PayPal Payouts)
 # Deploy from GitHub to Render.
-# Starting balance: R120,000,000 (simulated)
+# Starting balance: R120,000,000 (real-money)
 # ═══════════════════════════════════════════════════════════════
 
 from flask import Flask, request, jsonify, Response
@@ -10,6 +10,7 @@ import os
 from datetime import datetime
 import openpyxl
 from openpyxl.styles import Font, PatternFill
+import requests
 
 app = Flask(__name__)
 DB = "dashboard.db"
@@ -18,7 +19,7 @@ DB = "dashboard.db"
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
 START_BALANCE_ZAR = 120_000_000.00
-BROKER_MODE = "SIMULATED"
+BROKER_MODE = "real-money"
 BASE_CURRENCY = "ZAR"
 CRYPTO_SYMBOL = "BTC"
 ZAR_PER_USD = 18.50
@@ -29,10 +30,117 @@ BROKER_CONFIG = {
     "OANDA_ACCOUNT": os.environ.get("OANDA_ACCOUNT", ""),
     "LUNO_API_KEY": os.environ.get("LUNO_API_KEY", ""),
     "LUNO_API_SECRET": os.environ.get("LUNO_API_SECRET", ""),
+
+    # ── PAYPAL ──
     "PAYPAL_EMAIL": os.environ.get("PAYPAL_EMAIL", ""),
+    "PAYPAL_RECEIVER_EMAIL": os.environ.get("PAYPAL_RECEIVER_EMAIL", ""),
+    "PAYPAL_ME_USERNAME": os.environ.get("PAYPAL_ME_USERNAME", ""),
+
+    # ── PAYPAL API (LIVE) ──
+    "PAYPAL_MODE": os.environ.get("PAYPAL_MODE", "sandbox"),
+    "PAYPAL_CLIENT_ID": os.environ.get("PAYPAL_CLIENT_ID", ""),
+    "PAYPAL_CLIENT_SECRET": os.environ.get("PAYPAL_CLIENT_SECRET", ""),
+
+    # ── BANK ──
     "BANK_ACCOUNT": os.environ.get("BANK_ACCOUNT", ""),
+
+    # ── CRYPTO ──
     "BTC_WALLET": os.environ.get("BTC_WALLET", ""),
+    "LUNO_RECEIVER_ACCOUNT": os.environ.get("LUNO_RECEIVER_ACCOUNT", ""),
 }
+
+# ═══════════════════════════════════════════════════════════════
+# PAYPAL API HELPERS
+# ═══════════════════════════════════════════════════════════════
+def paypal_base_url():
+    return ("https://api-m.paypal.com" if BROKER_CONFIG["PAYPAL_MODE"] == "live"
+            else "https://api-m.sandbox.paypal.com")
+
+def paypal_get_token():
+    cid = BROKER_CONFIG["PAYPAL_CLIENT_ID"]
+    secret = BROKER_CONFIG["PAYPAL_CLIENT_SECRET"]
+    if not cid or not secret:
+        return None, "PAYPAL_CLIENT_ID / SECRET not set"
+    try:
+        r = requests.post(
+            f"{paypal_base_url()}/v1/oauth2/token",
+            auth=(cid, secret),
+            data={"grant_type": "client_credentials"},
+            headers={"Accept": "application/json"},
+            timeout=30
+        )
+        if r.status_code != 200:
+            return None, f"Auth {r.status_code}: {r.text[:200]}"
+        return r.json().get("access_token"), None
+    except Exception as e:
+        return None, f"Auth error: {e}"
+
+def paypal_send_payout(recipient_email, amount_usd, note="Dashboard withdrawal"):
+    """Send a PayPal Payout. Returns dict with status."""
+    token, err = paypal_get_token()
+    if err:
+        return {"status": "error", "reason": err}
+
+    batch_id = f"DASH_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    payload = {
+        "sender_batch_header": {
+            "sender_batch_id": batch_id,
+            "email_subject": "Payment from Dashboard",
+            "email_message": note
+        },
+        "items": [{
+            "recipient_type": "EMAIL",
+            "amount": {"value": f"{amount_usd:.2f}", "currency": "USD"},
+            "receiver": recipient_email,
+            "note": note,
+            "sender_item_id": f"W_{int(datetime.utcnow().timestamp())}"
+        }]
+    }
+    try:
+        r = requests.post(
+            f"{paypal_base_url()}/v1/payments/payouts",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}"
+            },
+            json=payload,
+            timeout=30
+        )
+        data = r.json()
+        if r.status_code == 201:
+            bh = data.get("batch_header", {})
+            return {
+                "status": "success",
+                "payout_id": bh.get("payout_batch_id"),
+                "batch_status": bh.get("batch_status"),
+                "raw": data
+            }
+        return {
+            "status": "error",
+            "reason": data.get("message", r.text[:200]),
+            "http_code": r.status_code,
+            "raw": data
+        }
+    except Exception as e:
+        return {"status": "error", "reason": f"Payout error: {e}"}
+
+def paypal_health():
+    """Returns True if credentials work."""
+    token, err = paypal_get_token()
+    if err:
+        return False, err
+    return True, "connected"
+
+def paypal_xclick_link(receiver_email, amount_usd, item_name="Dashboard Withdrawal"):
+    """Fallback link — external, shareable, not internal page."""
+    return (
+        "https://www.paypal.com/cgi-bin/webscr"
+        f"?cmd=_xclick"
+        f"&business={receiver_email}"
+        f"&amount={amount_usd:.2f}"
+        f"&currency_code=USD"
+        f"&item_name={item_name}"
+    )
 
 # ═══════════════════════════════════════════════════════════════
 # EXCEL SETUP
@@ -40,24 +148,18 @@ BROKER_CONFIG = {
 EXCEL_FILE = "withdrawals.xlsx"
 
 def init_excel():
-    """Create Excel file with PayPal + Master sheets if not exists."""
     if not os.path.exists(EXCEL_FILE):
         wb = openpyxl.Workbook()
 
-        # Master sheet
         ws_master = wb.active
         ws_master.title = "All Withdrawals"
-        master_headers = ["Date", "ID", "Method", "Amount (ZAR)",
-                          "Amount (USD)", "Crypto Amt", "Status", "Destination"]
-        ws_master.append(master_headers)
+        ws_master.append(["Date", "ID", "Method", "Amount (ZAR)",
+                          "Amount (USD)", "Crypto Amt", "Status", "Destination"])
 
-        # PayPal sheet
         ws_pp = wb.create_sheet("PayPal")
-        pp_headers = ["Date", "ID", "Amount (ZAR)", "Amount (USD)",
-                      "Status", "PayPal Email", "Pay Link"]
-        ws_pp.append(pp_headers)
+        ws_pp.append(["Date", "ID", "Amount (ZAR)", "Amount (USD)",
+                      "Status", "PayPal Email", "Note"])
 
-        # Style
         header_font = Font(bold=True, color="FFFFFF")
         header_fill = PatternFill(start_color="0A2540", end_color="0A2540", fill_type="solid")
         for ws in [ws_master, ws_pp]:
@@ -73,14 +175,11 @@ def init_excel():
 init_excel()
 
 def log_withdrawal_to_excel(wid, amount_zar, amount_usd, method,
-                            crypto_amount, status, destination, pay_link=""):
-    """Append row to Master + PayPal sheet (if method=paypal)."""
+                            crypto_amount, status, destination, note=""):
     try:
         wb = openpyxl.load_workbook(EXCEL_FILE)
 
-        # Master
-        ws_master = wb["All Withdrawals"]
-        ws_master.append([
+        wb["All Withdrawals"].append([
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             wid, method,
             round(amount_zar, 2), round(amount_usd, 2),
@@ -88,17 +187,15 @@ def log_withdrawal_to_excel(wid, amount_zar, amount_usd, method,
             status, destination
         ])
 
-        # PayPal
         if method == "paypal":
-            ws_pp = wb["PayPal"]
-            ws_pp.append([
+            wb["PayPal"].append([
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 wid,
                 round(amount_zar, 2),
                 round(amount_usd, 2),
                 status,
                 destination,
-                pay_link
+                note
             ])
 
         wb.save(EXCEL_FILE)
@@ -192,11 +289,13 @@ def fmt_zar(amount):
 
 @app.route('/health')
 def health():
+    pp_ok, pp_msg = paypal_health()
     return jsonify({
         "status": "ok",
         "mode": BROKER_MODE,
         "currency": BASE_CURRENCY,
         "crypto": CRYPTO_SYMBOL,
+        "paypal": {"connected": pp_ok, "mode": BROKER_CONFIG["PAYPAL_MODE"], "info": pp_msg},
         "time": datetime.utcnow().isoformat()
     })
 
@@ -294,7 +393,6 @@ def manual_trade():
         (datetime.utcnow().isoformat(), data["signal"],
          price, sl, tp, units, "manual")
     )
-
     return jsonify({"status": "created"})
 
 @app.route('/signal', methods=['POST'])
@@ -353,7 +451,7 @@ def close_trade(trade_id):
     })
 
 # ═══════════════════════════════════════════════════════════════
-# WITHDRAWAL — WITH PAYPAL + EXCEL
+# WITHDRAWAL — PAYOUTS API + _xclick FALLBACK
 # ═══════════════════════════════════════════════════════════════
 @app.route('/api/withdraw', methods=['POST'])
 def withdraw():
@@ -378,73 +476,127 @@ def withdraw():
     note = ""
     destination = ""
     pay_link = ""
+    final_status = "pending"
 
-    # ── PAYPAL (Excel + paypal.me link, no API verification) ──
+    # ── PAYPAL — Payouts API + _xclick fallback ──
     if method == "paypal":
-        paypal_email = BROKER_CONFIG["PAYPAL_EMAIL"]
-        if not paypal_email:
+        sender = BROKER_CONFIG["PAYPAL_EMAIL"]
+        receiver = BROKER_CONFIG["PAYPAL_RECEIVER_EMAIL"]
+
+        if not receiver or "@" not in receiver:
             return jsonify({
                 "status": "error",
-                "reason": "PAYPAL_EMAIL env var not set on Render"
+                "reason": "PAYPAL_RECEIVER_EMAIL must be set (different from PAYPAL_EMAIL)"
             }), 400
 
-        # paypal.me link — opens in browser, no API approval needed
-        pay_link = f"https://www.paypal.com/paypalme/{paypal_email}/{usd_amount}"
-        destination = paypal_email
-        note = f"→ PayPal ${usd_amount:,.2f} USD to {paypal_email}"
+        if sender and receiver.lower() == sender.lower():
+            return jsonify({
+                "status": "error",
+                "reason": "PAYPAL_RECEIVER_EMAIL must differ from PAYPAL_EMAIL (PayPal blocks self-payment)"
+            }), 400
+
+        destination = receiver
+
+        # Try Payouts API
+        api_ok, api_msg = paypal_health()
+        if api_ok:
+            payout = paypal_send_payout(receiver, usd_amount, note="Dashboard withdrawal")
+            if payout.get("status") == "success":
+                pay_link = payout.get("payout_id", "")
+                note = f"→ PayPal Payout ${usd_amount:,.2f} → {receiver} (Batch: {pay_link})"
+                final_status = "completed"
+            else:
+                # Fallback to _xclick
+                pay_link = paypal_xclick_link(receiver, usd_amount)
+                note = f"→ Fallback link for {receiver} (${usd_amount:,.2f}) — {payout.get('reason','api error')}"
+                final_status = "pending"
+        else:
+            pay_link = paypal_xclick_link(receiver, usd_amount)
+            note = f"→ Manual PayPal link for {receiver} (${usd_amount:,.2f}) — {api_msg}"
+            final_status = "pending"
 
     # ── LUNO ──
     elif method == "luno":
         btc = zar_to_btc(amount_zar)
         crypto_amount = btc
-        destination = "Luno ZAR account"
-        note = f"→ Luno: {btc:.8f} BTC"
+        luno_receiver = BROKER_CONFIG["LUNO_RECEIVER_ACCOUNT"] or "SET_LUNO_RECEIVER_ENV"
+        destination = luno_receiver
+        note = f"→ Luno: {btc:.8f} BTC to {luno_receiver}"
 
     # ── BTC ──
     elif method == "btc":
         btc = zar_to_btc(amount_zar)
         crypto_amount = btc
-        destination = BROKER_CONFIG["BTC_WALLET"] or "SET_BTC_WALLET_ENV"
-        note = f"→ BTC: {btc:.8f} to {destination}"
+        btc_receiver = BROKER_CONFIG["BTC_WALLET"]
+        if not btc_receiver:
+            return jsonify({
+                "status": "error",
+                "reason": "BTC_WALLET must be set (receiver wallet address)"
+            }), 400
+        destination = btc_receiver
+        note = f"→ BTC: {btc:.8f} to {btc_receiver}"
 
     # ── BANK ──
     elif method == "bank":
-        destination = BROKER_CONFIG["BANK_ACCOUNT"] or "SET_BANK_ACCOUNT_ENV"
-        note = f"→ SA Bank EFT: {fmt_zar(amount_zar)} to {destination}"
+        bank_receiver = BROKER_CONFIG["BANK_ACCOUNT"]
+        if not bank_receiver:
+            return jsonify({
+                "status": "error",
+                "reason": "BANK_ACCOUNT must be set (receiver account number)"
+            }), 400
+        destination = bank_receiver
+        note = f"→ SA Bank EFT: {fmt_zar(amount_zar)} to {bank_receiver}"
 
-    # Insert into DB
+    # Save to DB
     execute(
         """INSERT INTO withdrawals
            (timestamp, amount_zar, method, status, note, crypto_amount, pay_link)
            VALUES (?,?,?,?,?,?,?)""",
         (datetime.utcnow().isoformat(),
-         amount_zar, method, "pending", note, crypto_amount, pay_link)
+         amount_zar, method, final_status, note, crypto_amount, pay_link)
     )
     wid = query("SELECT last_insert_rowid() AS id", one=True)["id"]
 
-    # Write to Excel
     log_withdrawal_to_excel(
         wid=wid,
         amount_zar=amount_zar,
         amount_usd=usd_amount,
         method=method,
         crypto_amount=crypto_amount,
-        status="pending",
+        status=final_status,
         destination=destination,
-        pay_link=pay_link
+        note=note
     )
 
     return jsonify({
-        "status": "pending",
+        "status": final_status,
         "withdrawal_id": wid,
         "amount_zar": round(amount_zar, 2),
         "amount_usd": usd_amount,
         "crypto_amount": round(crypto_amount, 8),
         "method": method,
         "note": note,
-        "pay_link": pay_link,
         "destination": destination,
+        "pay_link": pay_link,
         "broker_mode": BROKER_MODE
+    })
+
+# ═══════════════════════════════════════════════════════════════
+# PAYPAL.ME — CLIENT PAYMENTS (separate)
+# ═══════════════════════════════════════════════════════════════
+@app.route('/api/paypal_me_link')
+def paypal_me_link():
+    username = BROKER_CONFIG["PAYPAL_ME_USERNAME"].strip().lstrip("@").replace(" ", "")
+    if not username:
+        return jsonify({"status": "unconfigured",
+                        "message": "Set PAYPAL_ME_USERNAME on Render"})
+    if "@" in username:
+        return jsonify({"status": "invalid",
+                        "message": "PAYPAL_ME_USERNAME must be a handle, not an email"})
+    return jsonify({
+        "status": "ok",
+        "link": f"https://paypal.me/{username}",
+        "username": username
     })
 
 @app.route('/api/withdrawals')
@@ -462,7 +614,6 @@ def cancel_withdrawal(wid):
     execute("UPDATE withdrawals SET status='cancelled' WHERE id=?", (wid,))
     return jsonify({"status": "cancelled"})
 
-# ── Download Excel ──
 @app.route('/download/excel')
 def download_excel():
     if not os.path.exists(EXCEL_FILE):
@@ -484,7 +635,6 @@ def reset():
 # ═══════════════════════════════════════════════════════════════
 # DASHBOARD HTML
 # ═══════════════════════════════════════════════════════════════
-
 DASHBOARD_HTML = r"""
 <!DOCTYPE html>
 <html lang="en">
@@ -513,6 +663,7 @@ h2{color:#00A8A8;font-size:1.1rem;margin-bottom:14px}
 .actions{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:24px}
 @media(max-width:900px){.actions{grid-template-columns:1fr}body{padding:16px}}
 .panel{background:#112d4e;border:1px solid #1e4976;border-radius:12px;padding:20px}
+.panel.receive{border-color:#00b5e2;box-shadow:0 0 15px rgba(0,181,226,.1)}
 .hint{color:#8899aa;font-size:.8rem;margin-bottom:14px}
 .row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
 input,select,button{padding:10px 14px;border-radius:8px;border:1px solid #1e4976;background:#0a1929;color:#e6edf3;font-size:.9rem;font-family:inherit}
@@ -527,6 +678,7 @@ button:hover{opacity:.85}
 .btn-luno{background:#00b5e2;color:#000;border:none}
 .btn-bank{background:#FFD700;color:#0a1929;border:none}
 .btn-btc{background:#f7931a;color:#000;border:none}
+.btn-copy{background:#00b5e2;color:#000;border:none}
 .btn-excel{background:#1D6F42;color:#fff;border:none;padding:10px 16px;border-radius:8px;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block}
 .msg{margin-top:12px;font-weight:600;font-size:.85rem;word-break:break-word}
 .msg a{color:#FFD700;font-weight:700}
@@ -538,6 +690,8 @@ tr:hover{background:#143557}
 footer{margin-top:32px;padding-top:16px;border-top:2px solid #1e4976;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
 .footer-note{color:#8899aa;font-size:.8rem}
 .withdraw-buttons{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.receive-box{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
+.receive-box input{flex:1;min-width:220px;font-family:monospace;font-size:.85rem}
 </style>
 </head>
 <body>
@@ -573,8 +727,8 @@ footer{margin-top:32px;padding-top:16px;border-top:2px solid #1e4976;display:fle
   </div>
 
   <div class="panel">
-    <h2>💸 Withdraw (ZAR)</h2>
-    <p class="hint">PayPal → Excel + paypal.me link · no API lock-in</p>
+    <h2>💸 Withdraw (Broker → You)</h2>
+    <p class="hint">Broker sends money to your receiver accounts.</p>
     <div class="row">
       <input type="number" id="wd-amount" step="0.01" placeholder="Amount in R"/>
     </div>
@@ -588,6 +742,19 @@ footer{margin-top:32px;padding-top:16px;border-top:2px solid #1e4976;display:fle
     <div style="margin-top:14px">
       <a href="/download/excel" class="btn-excel">📊 Download Excel</a>
     </div>
+  </div>
+</section>
+
+<section class="actions">
+  <div class="panel receive" style="grid-column:1 / -1;">
+    <h2>💰 Receive Payment (From Clients)</h2>
+    <p class="hint">Share this link so clients can pay you.</p>
+    <div class="receive-box">
+      <input type="text" id="paypal-me-link" readonly placeholder="Loading..."/>
+      <button onclick="copyLink()" class="btn-copy">📋 Copy Link</button>
+      <a id="paypal-me-open" href="#" target="_blank" class="btn-excel" style="background:#003087;">→ Open</a>
+    </div>
+    <div class="msg" id="me-msg"></div>
   </div>
 </section>
 
@@ -617,7 +784,7 @@ footer{margin-top:32px;padding-top:16px;border-top:2px solid #1e4976;display:fle
 
 <footer>
   <button onclick="resetAll()" class="btn-danger">🔄 Reset All</button>
-  <span class="footer-note" id="mode-note">Phase 1 · Simulated · No Broker</span>
+  <span class="footer-note" id="mode-note">Phase 2 · PayPal Payouts</span>
 </footer>
 
 <script>
@@ -633,7 +800,6 @@ function setColor(id,txt,val){
   if(val>0)el.classList.add('positive');
   if(val<0)el.classList.add('negative');
 }
-
 async function j(url, opts){return await (await fetch(url, opts||{})).json()}
 
 async function refreshAll(){
@@ -681,8 +847,11 @@ async function refreshAll(){
   for(const w of wds){
     let actions = '';
     if(w.status==='pending'){
-      actions = `<button class="btn-small" onclick="completeWd(${w.id})">Complete</button>
-                 <button class="btn-small btn-danger" onclick="cancelWd(${w.id})">Cancel</button>`;
+      if(w.method==='paypal' && w.pay_link){
+        actions += `<a href="${w.pay_link}" target="_blank" class="btn-small" style="text-decoration:none;background:#003087;color:#fff">Pay Link</a> `;
+      }
+      actions += `<button class="btn-small" onclick="completeWd(${w.id})">Complete</button>
+                  <button class="btn-small btn-danger" onclick="cancelWd(${w.id})">Cancel</button>`;
     } else {
       actions = w.status==='completed' ? '✅' : '❌';
     }
@@ -693,6 +862,33 @@ async function refreshAll(){
       <td>${w.method}</td><td>${w.status}</td><td>${actions}</td>
     </tr>`;
   }
+}
+
+async function loadPayPalMe(){
+  const r = await j('/api/paypal_me_link');
+  const input = document.getElementById('paypal-me-link');
+  const openBtn = document.getElementById('paypal-me-open');
+  if(r.status === 'ok'){
+    input.value = r.link;
+    openBtn.href = r.link;
+    openBtn.style.display = 'inline-block';
+  } else {
+    input.value = r.message || 'Not configured';
+    openBtn.style.display = 'none';
+  }
+}
+
+function copyLink(){
+  const input = document.getElementById('paypal-me-link');
+  const msg = document.getElementById('me-msg');
+  if(!input.value || input.value.includes('not') || input.value.startsWith('Set ')){
+    msg.textContent = '⚠️ Configure PAYPAL_ME_USERNAME on Render first';
+    msg.className = 'msg negative'; return;
+  }
+  input.select(); document.execCommand('copy');
+  msg.textContent = '✅ Link copied to clipboard!';
+  msg.className = 'msg positive';
+  setTimeout(() => { msg.textContent = ''; }, 2500);
 }
 
 async function simulateTrade(signal){
@@ -727,9 +923,10 @@ async function requestWithdrawal(method){
   });
   if(r.status==='rejected' || r.status==='error'){
     msg.textContent='❌ '+(r.reason||'failed'); msg.className='msg negative';
-  } else if(r.pay_link){
-    msg.innerHTML = `✅ #${r.withdrawal_id} · ${fmtZAR(r.amount_zar)} via PAYPAL — logged to Excel<br>`
-                  + `<a href="${r.pay_link}" target="_blank">→ Open PayPal.me to pay $${r.amount_usd}</a>`;
+  } else if(r.method==='paypal' && r.pay_link && r.pay_link.startsWith('http')){
+    msg.innerHTML = `✅ #${r.withdrawal_id} · ${fmtZAR(r.amount_zar)} via PAYPAL<br>`
+                  + `${r.note}<br>`
+                  + `<a href="${r.pay_link}" target="_blank">→ Open PayPal send link</a>`;
     msg.className='msg positive';
   } else {
     msg.textContent=`✅ #${r.withdrawal_id} · ${fmtZAR(r.amount_zar)} via ${r.method.toUpperCase()} — ${r.note}`;
@@ -743,6 +940,7 @@ async function cancelWd(id){await j('/api/withdraw/'+id+'/cancel',{method:'POST'
 async function resetAll(){if(!confirm('Reset all data?'))return;await j('/api/reset',{method:'POST'});refreshAll()}
 
 refreshAll();
+loadPayPalMe();
 setInterval(refreshAll, 10000);
 </script>
 </body>
